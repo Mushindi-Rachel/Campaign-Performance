@@ -145,6 +145,74 @@ export function buildCampaignSummaries(
   });
 }
 
+/**
+ * Splits every campaign's daily metric/GA4 rows into two chronological halves
+ * (oldest half vs. most recent half, by date — NOT by campaign) and returns
+ * period-over-period aggregates for each half. This is what trend arrows
+ * on the dashboard should actually be based on.
+ */
+function splitByDateHalves(summaries: CampaignSummary[]) {
+  const allDates = Array.from(
+    new Set(summaries.flatMap((s) => s.dailyMetrics.map((m) => m.date)))
+  ).sort();
+
+  if (allDates.length < 2) {
+    return { hasEnoughData: false as const };
+  }
+
+  const midpoint = allDates[Math.floor(allDates.length / 2)];
+
+  const isEarlier = (date: string) => date < midpoint;
+
+  let earlySpend = 0, recentSpend = 0;
+  let earlyLeads = 0, recentLeads = 0;
+  let earlyClicks = 0, recentClicks = 0;
+  let earlyImpressions = 0, recentImpressions = 0;
+  const earlyEngagement: number[] = [];
+  const recentEngagement: number[] = [];
+
+  for (const s of summaries) {
+    for (const m of s.dailyMetrics) {
+      if (isEarlier(m.date)) {
+        earlySpend += m.spend;
+        earlyLeads += m.conversions;
+        earlyClicks += m.clicks;
+        earlyImpressions += m.impressions;
+      } else {
+        recentSpend += m.spend;
+        recentLeads += m.conversions;
+        recentClicks += m.clicks;
+        recentImpressions += m.impressions;
+      }
+    }
+    for (const g of s.dailyGA4) {
+      if (isEarlier(g.date)) earlyEngagement.push(g.engagementRate);
+      else recentEngagement.push(g.engagementRate);
+    }
+  }
+
+  const earlyCvr = earlyClicks > 0 ? (earlyLeads / earlyClicks) * 100 : 0;
+  const recentCvr = recentClicks > 0 ? (recentLeads / recentClicks) * 100 : 0;
+  const earlyCpl = earlyLeads > 0 ? earlySpend / earlyLeads : 0;
+  const recentCpl = recentLeads > 0 ? recentSpend / recentLeads : 0;
+  const earlyEng = mean(earlyEngagement);
+  const recentEng = mean(recentEngagement);
+
+  return {
+    hasEnoughData: true as const,
+    earlySpend, recentSpend,
+    earlyLeads, recentLeads,
+    earlyCvr, recentCvr,
+    earlyCpl, recentCpl,
+    earlyEng, recentEng,
+  };
+}
+
+function pctChange(from: number, to: number): number {
+  if (from <= 0) return 0;
+  return ((to - from) / from) * 100;
+}
+
 export function computeDashboardKpis(summaries: CampaignSummary[]): DashboardKpis {
   const totalSpend = summaries.reduce((s, c) => s + c.totalSpend, 0);
   const totalLeads = summaries.reduce((s, c) => s + c.totalConversions, 0);
@@ -157,10 +225,19 @@ export function computeDashboardKpis(summaries: CampaignSummary[]): DashboardKpi
     : 0;
   const highValueLeads = summaries.reduce((s, c) => s + (c.conversionRate >= 7 ? c.totalConversions : 0), 0);
 
-  const half = Math.floor(summaries.length / 2) || 1;
-  const firstHalfSpend = summaries.slice(0, half).reduce((s, c) => s + c.totalSpend, 0);
-  const secondHalfSpend = summaries.slice(half).reduce((s, c) => s + c.totalSpend, 0);
-  const spendTrend = firstHalfSpend > 0 ? ((secondHalfSpend - firstHalfSpend) / firstHalfSpend) * 100 : 0;
+  const halves = splitByDateHalves(summaries);
+
+  let spendTrend = 0, leadsTrend = 0, conversionTrend = 0, cplTrend = 0, engagementTrend = 0;
+
+  if (halves.hasEnoughData) {
+    spendTrend = pctChange(halves.earlySpend, halves.recentSpend);
+    leadsTrend = pctChange(halves.earlyLeads, halves.recentLeads);
+    // conversionTrend and engagementTrend are rate metrics — report as
+    // percentage-point change, not a percent-of-percent change.
+    conversionTrend = halves.recentCvr - halves.earlyCvr;
+    cplTrend = pctChange(halves.earlyCpl, halves.recentCpl);
+    engagementTrend = halves.recentEng - halves.earlyEng;
+  }
 
   return {
     totalSpend,
@@ -170,10 +247,11 @@ export function computeDashboardKpis(summaries: CampaignSummary[]): DashboardKpi
     engagementRate,
     highValueLeads,
     spendTrend,
-    leadsTrend: 18,
-    conversionTrend: 2.1,
-    cplTrend: -8,
-    engagementTrend: 5,
+    leadsTrend,
+    conversionTrend,
+    cplTrend,
+    engagementTrend,
+    highValueLeadsTrend: leadsTrend, // high-value leads track total-lead momentum absent a dedicated threshold history
   };
 }
 

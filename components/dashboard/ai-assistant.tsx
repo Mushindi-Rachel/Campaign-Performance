@@ -3,7 +3,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
-import { Bot, Send, User } from 'lucide-react';
+import { Bot, Send, User, WifiOff } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { answerCampaignQuestion, type GeneratedInsight, type GeneratedRecommendation } from '@/lib/ai-engine';
 import type { CampaignSummary } from '@/lib/types';
@@ -26,6 +26,71 @@ const suggestedQuestions = [
   'What do you recommend?',
 ];
 
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+/**
+ * Calls the ai-chat edge function (real OpenAI-backed assistant). Returns
+ * null if the call fails or OpenAI isn't configured yet, so the caller can
+ * fall back to the local keyword-matched assistant instead of erroring out.
+ */
+async function askLlm(
+  question: string,
+  summaries: CampaignSummary[],
+  insights: GeneratedInsight[],
+  recommendations: GeneratedRecommendation[],
+  history: Message[],
+): Promise<string | null> {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return null;
+
+  try {
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/ai-chat`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        question,
+        context: {
+          summaries: summaries.map((s) => ({
+            name: s.campaign.name,
+            status: s.aiStatus,
+            totalSpend: s.totalSpend,
+            totalConversions: s.totalConversions,
+            avgCtr: s.avgCtr,
+            avgCpl: s.avgCpl,
+            conversionRate: s.conversionRate,
+            avgEngagementRate: s.avgEngagementRate,
+          })),
+          insights: insights.map((i) => ({
+            title: i.title,
+            description: i.description,
+            severity: i.severity,
+            campaignName: i.campaignName,
+          })),
+          recommendations: recommendations.map((r) => ({
+            title: r.title,
+            action: r.action,
+            priority: r.priority,
+            campaignName: r.campaignName,
+          })),
+        },
+        history: history.slice(-6).map((m) => ({
+          role: m.role === 'ai' ? 'assistant' : 'user',
+          content: m.content,
+        })),
+      }),
+    });
+
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.answer ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export function AiAssistant({ summaries, insights, recommendations }: AiAssistantProps) {
   const [messages, setMessages] = useState<Message[]>([
     {
@@ -35,6 +100,7 @@ export function AiAssistant({ summaries, insights, recommendations }: AiAssistan
   ]);
   const [input, setInput] = useState('');
   const [isThinking, setIsThinking] = useState(false);
+  const [usingFallback, setUsingFallback] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -43,18 +109,30 @@ export function AiAssistant({ summaries, insights, recommendations }: AiAssistan
     }
   }, [messages, isThinking]);
 
-  function handleAsk(question: string) {
+  async function handleAsk(question: string) {
     if (!question.trim() || isThinking) return;
     const userMsg: Message = { role: 'user', content: question };
+    const historyForRequest = messages;
     setMessages((prev) => [...prev, userMsg]);
     setInput('');
     setIsThinking(true);
 
-    setTimeout(() => {
-      const answer = answerCampaignQuestion(question, summaries, insights, recommendations);
-      setMessages((prev) => [...prev, { role: 'ai', content: answer }]);
+    const llmAnswer = await askLlm(question, summaries, insights, recommendations, historyForRequest);
+
+    if (llmAnswer) {
+      setUsingFallback(false);
+      setMessages((prev) => [...prev, { role: 'ai', content: llmAnswer }]);
       setIsThinking(false);
-    }, 600);
+    } else {
+      // OpenAI not configured or the call failed — fall back to the local
+      // keyword-matched assistant so the feature still works offline.
+      setUsingFallback(true);
+      setTimeout(() => {
+        const answer = answerCampaignQuestion(question, summaries, insights, recommendations);
+        setMessages((prev) => [...prev, { role: 'ai', content: answer }]);
+        setIsThinking(false);
+      }, 400);
+    }
   }
 
   return (
@@ -64,10 +142,19 @@ export function AiAssistant({ summaries, insights, recommendations }: AiAssistan
           <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary/10">
             <Bot className="h-4 w-4 text-primary" />
           </div>
-          <div>
+          <div className="flex-1">
             <CardTitle className="text-lg">Ask Campaign AI</CardTitle>
             <CardDescription>Ask questions about your campaign performance</CardDescription>
           </div>
+          {usingFallback && (
+            <div
+              className="flex items-center gap-1 rounded-full bg-amber-50 px-2 py-1 text-[10px] font-medium text-amber-700 dark:bg-amber-950/30 dark:text-amber-400"
+              title="OPENAI_API_KEY isn't configured on the ai-chat function (or the call failed), so this is using the built-in rule-based assistant instead of the LLM."
+            >
+              <WifiOff className="h-3 w-3" />
+              Offline mode
+            </div>
+          )}
         </div>
       </CardHeader>
       <CardContent className="flex flex-col flex-1 gap-3 overflow-hidden">

@@ -58,6 +58,7 @@ def fetch_ga4_metrics(days_back: int = 1) -> list[dict]:
             Dimension(name="date"),
             Dimension(name="sessionSource"),
             Dimension(name="sessionMedium"),
+            Dimension(name="sessionCampaignName"),
             Dimension(name="landingPagePlusQueryString"),
         ],
         metrics=[
@@ -89,6 +90,7 @@ def fetch_ga4_metrics(days_back: int = 1) -> list[dict]:
             "date": parsed_date,
             "session_source": dim_values.get("sessionSource", ""),
             "session_medium": dim_values.get("sessionMedium", ""),
+            "session_campaign_name": dim_values.get("sessionCampaignName", ""),
             "landing_page": dim_values.get("landingPagePlusQueryString", ""),
             "sessions": int(float(metric_values.get("sessions", 0))),
             "engaged_sessions": int(float(metric_values.get("engagedSessions", 0))),
@@ -102,11 +104,43 @@ def fetch_ga4_metrics(days_back: int = 1) -> list[dict]:
     return rows
 
 
-def _map_source_to_campaign(source: str, landing_page: str, campaigns: dict[str, str]) -> str | None:
+def _normalize(name: str) -> str:
+    """Lowercase and strip anything that isn't a letter/digit, for fuzzy name matching."""
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
+def _map_source_to_campaign(
+    campaign_name_dim: str,
+    source: str,
+    landing_page: str,
+    campaigns: dict[str, str],
+) -> str | None:
     """
-    Map a GA4 traffic source to a campaign UUID.
-    Heuristic: match by campaign name keywords in the source string or landing page.
+    Map a GA4 row to a campaign UUID.
+
+    Preferred path: GA4's `sessionCampaignName` dimension reflects the utm_campaign
+    tag on the ad/link, which should match the Meta campaign name (or a close
+    variant of it) exactly. We match on a normalized (lowercased, punctuation-
+    stripped) basis so "Enterprise eBook" matches "enterprise_ebook" or
+    "Enterprise-eBook-Q3" etc.
+
+    This requires your Meta ads to be UTM-tagged with utm_campaign matching (or
+    containing) the campaign name stored in the `campaigns` table. If that tagging
+    discipline isn't in place yet, this falls back to a keyword heuristic on
+    source/landing page, which is best-effort only and should be treated as a
+    stopgap, not a long-term attribution strategy.
     """
+    norm_campaign_dim = _normalize(campaign_name_dim)
+
+    if norm_campaign_dim and norm_campaign_dim not in ("(notset)", "(direct)none"):
+        for name, campaign_id in campaigns.items():
+            norm_name = _normalize(name)
+            if norm_name and (norm_name in norm_campaign_dim or norm_campaign_dim in norm_name):
+                return campaign_id
+
+    # Fallback heuristic — only used when no utm_campaign tag was present or it
+    # didn't match any known campaign name. Keep this list in sync with real
+    # campaign names, and prefer fixing UTM tagging over expanding this map.
     source_lower = source.lower()
     landing_lower = landing_page.lower()
 
@@ -123,7 +157,6 @@ def _map_source_to_campaign(source: str, landing_page: str, campaigns: dict[str,
             if kw in source_lower or kw in landing_lower:
                 return campaigns.get(campaign_name)
 
-    # Default: if source is "Facebook" or "Instagram" or "Meta", map to first Meta campaign
     if any(x in source_lower for x in ["facebook", "instagram", "meta"]):
         return campaigns.get("Enterprise eBook")
 
@@ -145,6 +178,7 @@ def transform_ga4_rows(raw_rows: list[dict]) -> list[dict]:
     transformed: list[dict] = []
     for row in raw_rows:
         campaign_id = _map_source_to_campaign(
+            row.get("session_campaign_name", ""),
             row.get("session_source", ""),
             row.get("landing_page", ""),
             name_to_id,

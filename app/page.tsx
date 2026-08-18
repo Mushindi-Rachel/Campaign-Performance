@@ -212,7 +212,7 @@ export default function Dashboard() {
           <KpiCard
             label="High-Value Leads"
             value={formatNumber(kpis.highValueLeads)}
-            trend={21}
+            trend={kpis.highValueLeadsTrend}
             icon={<Award className="h-5 w-5" />}
             accent="rose"
           />
